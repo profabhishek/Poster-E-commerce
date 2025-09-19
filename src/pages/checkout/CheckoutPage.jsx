@@ -25,7 +25,7 @@ export default function CheckoutPage() {
   const navigate = useNavigate();
 
   const BASE_URL = import.meta.env.VITE_API_BASE_URL;
-  const userId = localStorage.getItem("user_id") || "guest";
+  const userId = localStorage.getItem("user_id");
   const token = localStorage.getItem("user_token");
 
   // ---------- state ----------
@@ -35,6 +35,11 @@ export default function CheckoutPage() {
 
   const [addresses, setAddresses] = useState([]);
   const [selectedAddressIndex, setSelectedAddressIndex] = useState(0);
+
+  if (!userId) {
+  navigate("/login");
+  return null; // or show spinner
+}
 
   const [address, setAddress] = useState({
     fullName: "",
@@ -205,6 +210,20 @@ export default function CheckoutPage() {
           method: "POST",
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
+
+        if (cart?.items?.length) {
+          for (const cartItem of cart.items) {
+            await fetch(`${BASE_URL}/api/cart/${userId}/remove?productId=${cartItem.productId}`, {
+              method: "DELETE",
+              headers: token ? { Authorization: `Bearer ${token}` } : {},
+            });
+          }
+        }
+
+        // clear frontend cart too
+        localStorage.removeItem("cart");
+        setCart(null);
+
         toast.success("Order placed (COD)!");
         navigate("/order-success");
         return;
@@ -227,8 +246,7 @@ export default function CheckoutPage() {
         description: "Order Payment",
         handler: async function (response) {
           try {
-            // confirm payment in backend
-            await fetch(`${BASE_URL}/api/checkout/confirm-payment`, {
+            const res = await fetch(`${BASE_URL}/api/checkout/confirm-payment`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -236,21 +254,70 @@ export default function CheckoutPage() {
               },
               body: JSON.stringify({
                 orderId: order.id,
-                razorpay_order_id: response.razorpay_order_id,
-                razorpay_payment_id: response.razorpay_payment_id,
-                razorpay_signature: response.razorpay_signature,
+                razorpayOrderId: response.razorpay_order_id,
+                razorpayPaymentId: response.razorpay_payment_id,
+                razorpaySignature: response.razorpay_signature,
               }),
             });
-            toast.success("Payment successful!");
-            navigate("/order-success");
+
+            if (res.ok) {
+              // 🧹 clear cart in backend
+            if (cart?.items?.length) {
+              for (const cartItem of cart.items) {
+                await fetch(`${BASE_URL}/api/cart/${userId}/remove?productId=${cartItem.productId}`, {
+                  method: "DELETE",
+                  headers: token ? { Authorization: `Bearer ${token}` } : {},
+                });
+              }
+            }
+
+              // clear frontend
+              localStorage.removeItem("cart");
+              setCart(null);
+
+              toast.success("Payment successful!");
+              setTimeout(() => {
+                navigate("/order-success");
+              }, 500);
+            } else {
+              const errorText = await res.text();
+              console.error("Confirm payment failed:", errorText);
+              toast.error("Could not confirm payment. Please contact support.");
+            }
           } catch (err) {
-            console.error(err);
-            toast.error("Could not confirm payment");
+            console.error("Payment confirmation error:", err);
+            toast.error("Could not confirm payment. Please try again.");
           }
+        },
+        modal: {
+          ondismiss: async function () {
+            console.warn("Payment popup closed by user");
+
+            // optional: mark order as FAILED in backend
+            await fetch(`${BASE_URL}/api/checkout/payment-failed`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              },
+              body: JSON.stringify({
+                orderId: order.id,
+                reason: "Payment window closed by user",
+              }),
+            });
+
+            toast.error("Payment was cancelled.");
+          },
         },
         theme: { color: "#3399cc" },
       };
 
+      if (!window.Razorpay) {
+        alert("Razorpay SDK not loaded");
+        return;
+      }
+
+      console.log("Opening Razorpay:", options);
       const rzp = new window.Razorpay(options);
       rzp.open();
 
@@ -261,6 +328,39 @@ export default function CheckoutPage() {
       setPlacing(false);
     }
   };
+
+  // ---------- apply coupon ----------
+const applyCoupon = async () => {
+  if (!coupon.trim()) return toast.error("Please enter a coupon code");
+
+  setCouponApplying(true);
+  try {
+    const res = await fetch(`${BASE_URL}/api/coupons/apply`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        userId,
+        couponCode: coupon.trim(),
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || "Invalid coupon");
+
+    setCouponMeta(data); // store response (e.g. { discountAmount, message })
+    toast.success(data.message || "Coupon applied!");
+  } catch (err) {
+    console.error("Coupon error:", err);
+    toast.error(err.message || "Could not apply coupon");
+    setCouponMeta(null);
+  } finally {
+    setCouponApplying(false);
+  }
+};
+
 
   // ---------- rest of your JSX (unchanged) ----------
   const payCta =
@@ -523,38 +623,46 @@ export default function CheckoutPage() {
                 <h2 className="text-lg font-semibold">Order Summary</h2>
               </div>
 
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span>Items ({cart.items.length})</span>
-                  <span>₹{pricing.subtotal}</span>
-                </div>
-
-                <div className="flex justify-between">
-                  <span>Shipping</span>
-                  <span>{pricing.shipping === 0 ? <Badge className="bg-green-600">Free</Badge> : `₹${pricing.shipping}`}</span>
-                </div>
-
-                <div className="flex justify-between">
-                  <span>Coupon</span>
-                  <span className={pricing.couponDiscount ? "text-green-600 font-medium" : ""}>
-                    −₹{pricing.couponDiscount}
-                  </span>
-                </div>
-
-                {gst.addGst && (
-                  <div className="text-xs text-gray-600">
-                    GST Invoice: <span className="font-medium">{gst.businessName}</span> • GSTIN {gst.gstin}
+              {!pricing ? (
+                <p className="text-sm text-gray-500">Loading order summary…</p>
+              ) : (
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span>Items ({cart?.items?.length || 0})</span>
+                    <span>₹{pricing?.subtotal ?? 0}</span>
                   </div>
-                )}
 
-                <Separator className="my-2" />
+                  <div className="flex justify-between">
+                    <span>Shipping</span>
+                    <span>
+                      {pricing?.shipping === 0
+                        ? <Badge className="bg-green-600">Free</Badge>
+                        : `₹${pricing?.shipping ?? 0}`}
+                    </span>
+                  </div>
 
-                <div className="flex justify-between font-semibold text-base">
-                  <span>Total</span>
-                  <span>₹{pricing.total}</span>
+                  <div className="flex justify-between">
+                    <span>Coupon</span>
+                    <span className={pricing?.couponDiscount ? "text-green-600 font-medium" : ""}>
+                      −₹{pricing?.couponDiscount ?? 0}
+                    </span>
+                  </div>
+
+                  {gst.addGst && (
+                    <div className="text-xs text-gray-600">
+                      GST Invoice: <span className="font-medium">{gst.businessName}</span> • GSTIN {gst.gstin}
+                    </div>
+                  )}
+
+                  <Separator className="my-2" />
+
+                  <div className="flex justify-between font-semibold text-base">
+                    <span>Total</span>
+                    <span>₹{pricing?.total ?? 0}</span>
+                  </div>
+                  <div className="text-xs text-gray-500">Inclusive of all taxes.</div>
                 </div>
-                <div className="text-xs text-gray-500">Inclusive of all taxes.</div>
-              </div>
+              )}
 
               {/* coupon */}
               <div className="mt-4 flex gap-2">
@@ -583,7 +691,7 @@ export default function CheckoutPage() {
             <Button
               className="w-full h-12 text-base font-semibold"
               onClick={handlePlaceOrder}
-              disabled={placing}
+              disabled={placing || !pricing}
             >
               {placing ? (
                 <>
@@ -605,6 +713,7 @@ export default function CheckoutPage() {
               </ul>
             </div>
           </aside>
+
         </div>
 
         {/* Back to cart */}
